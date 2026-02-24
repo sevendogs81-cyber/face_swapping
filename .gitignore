@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 模型文件（体积大，需单独下载）
+models/
+*.onnx
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
+# 输出与报告（数据集 SHHQ-1.0、posture-demo 会上传）
+outputs/
+reports/
+
+# 大文件与压缩包
+*.zip
+*.tar
+*.tar.gz
+
+# 单次运行输出图片
+out_*.jpg
+out_*.png
+out_*.jpeg
+
+# 测试/参考大图（可选保留小图）
+ref.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
