@@ -17,9 +17,9 @@ from demo_m4 import run_pipeline
 # 运行模式：
 # - single: 仅处理 SINGLE_IN_IMG，结果另存到 SINGLE_OUT_IMG
 # - batch : 批量处理 INPUT_DIR 目录下全部图片（并在 demo_m4 内自动走 batch->eval）
-MODE = "batch"  # "single" | "batch"
+MODE = "single"  # "single" | "batch"
 INPUT_DIR = "posture-demo"
-SINGLE_IN_IMG = "test.jpg"
+SINGLE_IN_IMG = "test1.jpg"
 SINGLE_OUT_IMG = "out_longcat_image_edit_turbo.jpg"
 
 # 模型与设备（按单模型脚本固定）

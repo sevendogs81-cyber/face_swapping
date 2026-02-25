@@ -862,6 +862,41 @@ def match_color_mean_std_in_mask(
     return Image.fromarray(out, mode="RGB")
 
 
+def match_color_lab_in_mask(
+    gen_patch: Image.Image,
+    ref_patch: Image.Image,
+    mask_patch: Image.Image,
+) -> Image.Image:
+    """
+    在 LAB 色彩空间中将生成结果的亮度与色度对齐到原 ROI。
+    相比 RGB 逐通道匹配更符合人眼感知，能更有效消除局部色差。
+    """
+    gen = np.asarray(gen_patch.convert("RGB"), dtype=np.uint8)
+    ref = np.asarray(ref_patch.convert("RGB"), dtype=np.uint8)
+    m = np.asarray(mask_patch.convert("L"), dtype=np.uint8)
+    sel = m >= 128
+    if int(sel.sum()) < 32:
+        return gen_patch
+
+    gen_lab = cv2.cvtColor(gen, cv2.COLOR_RGB2LAB).astype(np.float64)
+    ref_lab = cv2.cvtColor(ref, cv2.COLOR_RGB2LAB).astype(np.float64)
+
+    out_lab = gen_lab.copy()
+    for c in range(3):
+        gc = gen_lab[:, :, c]
+        rc = ref_lab[:, :, c]
+        g_mu = float(gc[sel].mean())
+        r_mu = float(rc[sel].mean())
+        g_std = float(gc[sel].std() + 1e-6)
+        r_std = float(rc[sel].std() + 1e-6)
+        mapped = ((gc - g_mu) * (r_std / g_std)) + r_mu
+        out_lab[:, :, c] = mapped
+
+    out_lab = np.clip(out_lab, 0, 255).astype(np.uint8)
+    out_rgb = cv2.cvtColor(out_lab, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(out_rgb, mode="RGB")
+
+
 def smooth_artifacts_in_mask(
     gen_patch: Image.Image,
     mask_patch: Image.Image,
@@ -886,6 +921,45 @@ def smooth_artifacts_in_mask(
     out = gen.astype(np.float32) * (1.0 - w[:, :, None]) + smooth.astype(np.float32) * w[:, :, None]
     out = np.clip(out, 0.0, 255.0).astype(np.uint8)
     return Image.fromarray(out, mode="RGB")
+
+
+def poisson_blend_patch(
+    base_patch: Image.Image,
+    gen_patch: Image.Image,
+    mask_patch: Image.Image,
+    feather_ratio: float = 0.12,
+) -> Image.Image:
+    """
+    用 Poisson 融合 (cv2.seamlessClone) 替代简单 alpha 融合。
+    通过梯度域求解使边界处颜色/亮度自然过渡，从根本上消除色差接缝。
+    失败时自动回退到 alpha 融合。
+    """
+    src = np.asarray(gen_patch.convert("RGB"), dtype=np.uint8)
+    dst = np.asarray(base_patch.convert("RGB"), dtype=np.uint8)
+    m = np.asarray(mask_patch.convert("L"), dtype=np.uint8)
+
+    mask_bin = np.where(m > 64, 255, 0).astype(np.uint8)
+    if int((mask_bin > 0).sum()) < 64:
+        return blend_patch(base_patch, gen_patch, mask_patch, feather_ratio)
+
+    h, w = dst.shape[:2]
+    erode_r = max(2, int(min(h, w) * 0.02))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_r * 2 + 1, erode_r * 2 + 1))
+    mask_safe = cv2.erode(mask_bin, kernel, iterations=1)
+    if int((mask_safe > 0).sum()) < 64:
+        return blend_patch(base_patch, gen_patch, mask_patch, feather_ratio)
+
+    ys, xs = np.where(mask_safe > 0)
+    cx = int(round(float(xs.mean())))
+    cy = int(round(float(ys.mean())))
+    cx = max(1, min(cx, w - 2))
+    cy = max(1, min(cy, h - 2))
+
+    try:
+        result = cv2.seamlessClone(src, dst, mask_safe, (cx, cy), cv2.NORMAL_CLONE)
+        return Image.fromarray(result, mode="RGB")
+    except Exception:
+        return blend_patch(base_patch, gen_patch, mask_patch, feather_ratio)
 
 
 def obfuscate_inside_mask(img_pil: Image.Image, mask_pil: Image.Image, seed: int) -> Image.Image:
@@ -1072,7 +1146,90 @@ def build_pipe(spec: ModelSpec, device: str, cpu_offload: str):
 
 
 def supports_mask_inpaint(spec: ModelSpec) -> bool:
-    return spec.loader in ("auto_inpaint", "flux_fill_nf4", "qwen_cpp")
+    return spec.loader in ("auto_inpaint", "flux_fill_nf4", "qwen_cpp") or spec.key == "flux2_klein_9b"
+
+
+def _run_flux2_inpaint_equivalent(
+    pipe: Any,
+    image_pil: Image.Image,
+    mask_pil: Image.Image,
+    plan: RuntimePlan,
+    generator: Optional[torch.Generator],
+) -> Image.Image:
+    """
+    在 diffusers 的 Flux2KleinPipeline 上近似 ComfyUI 的 InpaintModelConditioning：
+    - 以原图作为 condition image
+    - 每个 denoise step 后把非 mask 区域 latent 回写为源图 latent（锁背景）
+    """
+    if not all(hasattr(pipe, x) for x in ("image_processor", "vae_scale_factor", "_encode_vae_image", "_pack_latents")):
+        raise RuntimeError("flux2 pipe lacks required inpaint-equivalent hooks")
+
+    cond_img = image_pil.convert("RGB")
+    cond_mask = mask_pil.convert("L")
+
+    w, h = cond_img.size
+    if w * h > 1024 * 1024:
+        cond_img = pipe.image_processor._resize_to_target_area(cond_img, 1024 * 1024)
+        cond_mask = cond_mask.resize(cond_img.size, resample=Image.BILINEAR)
+
+    multiple_of = int(pipe.vae_scale_factor) * 2
+    w = max(multiple_of, (cond_img.size[0] // multiple_of) * multiple_of)
+    h = max(multiple_of, (cond_img.size[1] // multiple_of) * multiple_of)
+    cond_img_t = pipe.image_processor.preprocess(cond_img, height=h, width=w, resize_mode="crop")
+    cond_mask = cond_mask.resize((w, h), resample=Image.BILINEAR)
+
+    exec_device = getattr(pipe, "_execution_device", "cpu")
+    exec_device = torch.device(exec_device) if not isinstance(exec_device, torch.device) else exec_device
+
+    with torch.no_grad():
+        src_latents_4d = pipe._encode_vae_image(
+            image=cond_img_t.to(device=exec_device, dtype=pipe.vae.dtype),
+            generator=generator,
+        )
+        src_latents = pipe._pack_latents(src_latents_4d)
+
+    mask_np = np.asarray(cond_mask, dtype=np.float32) / 255.0
+    mask_t = torch.from_numpy(mask_np)[None, None, :, :].to(device=exec_device, dtype=src_latents_4d.dtype)
+    mask_lat_4d = torch.nn.functional.interpolate(
+        mask_t,
+        size=(int(src_latents_4d.shape[-2]), int(src_latents_4d.shape[-1])),
+        mode="bilinear",
+        align_corners=False,
+    )
+    edit_mask = mask_lat_4d.reshape(1, 1, -1).permute(0, 2, 1).clamp_(0.0, 1.0)
+    mask_gain = float(np.clip(plan.strength, 0.05, 1.0))
+    if abs(mask_gain - 1.0) > 1e-6:
+        edit_mask = (edit_mask * mask_gain).clamp_(0.0, 1.0)
+
+    def _callback(_pipe: Any, _step: int, _t: torch.Tensor, callback_kwargs: Dict[str, torch.Tensor]):
+        latents = callback_kwargs["latents"]
+        src = src_latents
+        m = edit_mask
+        if src.shape[0] != latents.shape[0]:
+            src = src.repeat(latents.shape[0], 1, 1)
+        if m.shape[0] != latents.shape[0]:
+            m = m.repeat(latents.shape[0], 1, 1)
+        src = src.to(device=latents.device, dtype=latents.dtype)
+        m = m.to(device=latents.device, dtype=latents.dtype)
+        callback_kwargs["latents"] = src * (1.0 - m) + latents * m
+        return callback_kwargs
+
+    kwargs = dict(
+        prompt=plan.prompt,
+        image=cond_img,
+        num_inference_steps=int(plan.steps),
+        guidance_scale=float(plan.guidance),
+        width=int(cond_img.size[0]),
+        height=int(cond_img.size[1]),
+        generator=generator,
+        callback_on_step_end=_callback,
+        callback_on_step_end_tensor_inputs=["latents"],
+    )
+    output = _call_pipe_filtered(pipe, **kwargs)
+    images = _extract_images(output)
+    if not images:
+        raise RuntimeError("flux2 inpaint-equivalent call returned no images")
+    return images[0].convert("RGB")
 
 
 def model_plan(spec: ModelSpec, cfg: RunConfig) -> RuntimePlan:
@@ -1156,6 +1313,21 @@ def run_model_call(
         gdev = device if device.startswith("cuda") else "cpu"
         gen = torch.Generator(device=gdev).manual_seed(int(seed))
 
+    if spec.key == "flux2_klein_9b":
+        try:
+            out = _run_flux2_inpaint_equivalent(
+                pipe=pipe,
+                image_pil=model_input,
+                mask_pil=mask_pil,
+                plan=plan,
+                generator=gen,
+            )
+            if out.size != image_pil.size:
+                out = out.resize(image_pil.size, resample=Image.LANCZOS)
+            return out
+        except Exception as e:
+            print(f"[WARN] flux2 inpaint-equivalent fallback to diffusion-edit call: {e}")
+
     kwargs = dict(
         prompt=plan.prompt,
         negative_prompt=plan.negative_prompt,
@@ -1226,7 +1398,7 @@ def run_local_swap_once(
         local_steps = int(plan.steps)
         local_guidance = float(plan.guidance)
         local_strength = float(plan.strength)
-        local_feather = 0.08 if spec.key in ("kandinsky5_i2i_lite", "sd35_img2img") else 0.12
+        local_feather = 0.12
         if is_hard:
             local_mask_blur = max(2, int(round(float(cfg.mask_blur) * float(cfg.hard_mask_blur_scale))))
             local_roi_pad_ratio = float(cfg.roi_pad_ratio) + float(cfg.hard_roi_pad_extra)
@@ -1335,17 +1507,12 @@ def run_local_swap_once(
             max_scale_delta=0.10,
         )
 
-        # SDXL 在复杂光照样本上先做颜色回对齐 + 高频伪影抑制，缓解“花脸”。
-        if spec.key == "sdxl_inpaint":
-            out_roi = match_color_mean_std_in_mask(out_roi, roi_img_base, roi_mask_base)
+        out_roi = match_color_lab_in_mask(out_roi, roi_img_base, roi_mask_base)
 
-        # Kandinsky/SD3.5 先做 mask 内颜色回对齐，降低“白雾/灰蒙”。
         if spec.key in ("kandinsky5_i2i_lite", "sd35_img2img"):
-            out_roi = match_color_mean_std_in_mask(out_roi, roi_img_base, roi_mask_base)
-
-        # 用软 alpha 融合贴回，降低边缘接缝与贴片感。
-        # 对 Kandinsky/SD3.5 收窄融合羽化带，减少边缘发白光晕感。
-        blend = blend_patch(roi_img_base, out_roi, roi_mask_base, feather_ratio=float(local_feather))
+            blend = blend_patch(roi_img_base, out_roi, roi_mask_base, feather_ratio=float(local_feather))
+        else:
+            blend = poisson_blend_patch(roi_img_base, out_roi, roi_mask_base, feather_ratio=float(local_feather))
         out.paste(blend, (x1, y1))
 
     return out
