@@ -78,8 +78,11 @@ QWEN_PROMPT = (
     "Photo-realistic, natural skin texture, sharp eyes, high detail."
 )
 FLUX2_PROMPT = (
-    "Replace only the inner face identity with a different realistic person, same head pose and facial "
-    "expression, consistent lighting, soft diffused lighting, clear smooth skin, even complexion, photorealistic."
+    "Anonymize the person's face by replacing only the inner face area with a different realistic identity "
+    "(not the same person and not a look-alike). Keep the same head pose, gaze direction, facial expression, "
+    "lighting, hairstyle and background. Keep ears, neck and clothing unchanged. "
+    "Do not preserve recognizable identity cues from the input face. "
+    "Photo-realistic, natural skin texture, sharp eyes, high detail."
 )
 
 
@@ -209,6 +212,11 @@ class RunConfig:
     skip_existing: bool
     no_eval: bool
     fail_fast: bool
+
+    # 控制是否在 FLUX2 等流水线中使用原图作为 latent 初值来源：
+    # - True  : 标准 img2img 行为（初始 latent 由 encode(image) + noise 决定）
+    # - False : 以纯噪声初始化 latent，仅在回写阶段用原图锁定非 mask 区域
+    use_image_latents: bool
 
 
 def _safe_json(obj: Any) -> Any:
@@ -1155,11 +1163,13 @@ def _run_flux2_inpaint_equivalent(
     mask_pil: Image.Image,
     plan: RuntimePlan,
     generator: Optional[torch.Generator],
+    use_image_latents: bool,
 ) -> Image.Image:
     """
     在 diffusers 的 Flux2KleinPipeline 上近似 ComfyUI 的 InpaintModelConditioning：
     - 以原图作为 condition image
     - 每个 denoise step 后把非 mask 区域 latent 回写为源图 latent（锁背景）
+    - 为加强去身份化：mask 区域用「更强噪声」初始化 latent，避免原图编码主导、步数少时改不动。
     """
     if not all(hasattr(pipe, x) for x in ("image_processor", "vae_scale_factor", "_encode_vae_image", "_pack_latents")):
         raise RuntimeError("flux2 pipe lacks required inpaint-equivalent hooks")
@@ -1201,6 +1211,28 @@ def _run_flux2_inpaint_equivalent(
     if abs(mask_gain - 1.0) > 1e-6:
         edit_mask = (edit_mask * mask_gain).clamp_(0.0, 1.0)
 
+    # 初始化 latent：
+    # - use_image_latents=True  时：完全交给 pipeline 内部，根据 image 做 img2img 初始化；
+    # - use_image_latents=False 时：使用纯噪声初始化，彻底切断原图在 latent 初值中的影响。
+    initial_latents_packed: Optional[torch.Tensor] = None
+    if not use_image_latents:
+        # 直接在已 pack 过的 latent 空间中采样噪声，避免依赖具体 _pack_latents 签名。
+        shape_packed = src_latents.shape
+        if generator is not None:
+            noise_packed = torch.randn(
+                shape_packed,
+                generator=generator,
+                device=src_latents.device,
+                dtype=src_latents.dtype,
+            )
+        else:
+            noise_packed = torch.randn(
+                shape_packed,
+                device=src_latents.device,
+                dtype=src_latents.dtype,
+            )
+        initial_latents_packed = noise_packed
+
     def _callback(_pipe: Any, _step: int, _t: torch.Tensor, callback_kwargs: Dict[str, torch.Tensor]):
         latents = callback_kwargs["latents"]
         src = src_latents
@@ -1225,6 +1257,8 @@ def _run_flux2_inpaint_equivalent(
         callback_on_step_end=_callback,
         callback_on_step_end_tensor_inputs=["latents"],
     )
+    if initial_latents_packed is not None:
+        kwargs["latents"] = initial_latents_packed
     output = _call_pipe_filtered(pipe, **kwargs)
     images = _extract_images(output)
     if not images:
@@ -1247,8 +1281,12 @@ def model_plan(spec: ModelSpec, cfg: RunConfig) -> RuntimePlan:
     elif spec.key == "flux2_klein_9b":
         steps = 4
         guidance = 1.0
-        strength = min(strength, 0.70)
+        strength = max(strength, 0.70)
         prompt = FLUX2_PROMPT
+        negative = (
+            negative
+            + ", same person, same identity, look-alike, recognizable face, identical twin"
+        ).strip(", ")
     elif spec.key == "qwen_image_edit_2511_gguf":
         steps = 20
         guidance = 2.5
@@ -1290,12 +1328,15 @@ def run_model_call(
     mask_pil: Image.Image,
     plan: RuntimePlan,
     seed: int,
+    use_image_latents: bool,
 ) -> Image.Image:
     # 统一一次模型调用：
     # - 支持 mask inpaint 的模型直接用原 ROI+mask
     # - 仅 edit/img2img 的模型先做 mask 内扰动再编辑
     if supports_mask_inpaint(spec):
-        # Qwen 在部分样本上会保留较多身份特征；对 mask 内做轻扰动可提升去身份化。
+        # 支持 mask inpaint 的模型：
+        # - Qwen：在 mask 内做较强扰动，尽量打散原有身份；
+        # - 其余模型：直接用原图作为输入。
         if spec.loader == "qwen_cpp":
             model_input = obfuscate_inside_mask(image_pil, mask_pil, seed=seed)
         else:
@@ -1321,6 +1362,7 @@ def run_model_call(
                 mask_pil=mask_pil,
                 plan=plan,
                 generator=gen,
+                use_image_latents=use_image_latents,
             )
             if out.size != image_pil.size:
                 out = out.resize(image_pil.size, resample=Image.LANCZOS)
@@ -1483,6 +1525,7 @@ def run_local_swap_once(
             mask_pil=roi_mask_pad,
             plan=local_plan,
             seed=local_seed,
+            use_image_latents=cfg.use_image_latents,
         )
 
         out_rs = crop_back_to_original(out_pad, pad=pad, orig_size_wh=roi_img_rs.size)
@@ -1726,6 +1769,7 @@ def run_pipeline(
     skip_existing: bool = False,
     no_eval: bool = False,
     fail_fast: bool = False,
+    use_image_latents: bool = False,
 ) -> Dict[str, Any]:
     model_keys = _normalize_models_input(models)
     mode2 = str(mode).strip().lower()
@@ -1785,6 +1829,7 @@ def run_pipeline(
         skip_existing=bool(skip_existing),
         no_eval=bool(no_eval),
         fail_fast=bool(fail_fast),
+        use_image_latents=bool(use_image_latents),
     )
 
     print(f"[INFO] input_dir={cfg.input_dir}")

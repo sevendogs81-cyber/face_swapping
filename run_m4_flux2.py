@@ -17,20 +17,20 @@ from demo_m4 import run_pipeline
 # 运行模式：
 # - single: 仅处理 SINGLE_IN_IMG，结果另存到 SINGLE_OUT_IMG
 # - batch : 批量处理 INPUT_DIR 目录下全部图片（并在 demo_m4 内自动走 batch->eval）
-MODE = "single"  # "single" | "batch"
+MODE = "batch"  # "single" | "batch"
 INPUT_DIR = "posture-demo"
 SINGLE_IN_IMG = "test1.jpg"
 SINGLE_OUT_IMG = "out_flux2_klein_9b.jpg"
 
 # 模型与设备（按单模型脚本固定）
 MODEL_KEY = "flux2_klein_9b"
-CTX_ID = 5
-DEVICE = "cuda:5"
+CTX_ID = 0
+DEVICE = "cuda:0"
 
 SEED = 42
 STEPS = 4
 GUIDANCE = 1.0
-STRENGTH = 0.70
+STRENGTH = 1.0
 
 PAD_RATIO = 0.35
 MASK_BLUR = 8
